@@ -83,6 +83,19 @@ beforeEach(() => {
 });
 
 describe("agentCliCommand", () => {
+  it("passes explicit session keys through to gateway routing", async () => {
+    await withTempStore(async () => {
+      mockGatewaySuccessReply();
+
+      await agentCliCommand({ message: "hi", sessionKey: "agent:ops:main" }, runtime);
+
+      const request = vi.mocked(callGateway).mock.calls[0]?.[0] as {
+        params?: { sessionKey?: string };
+      };
+      expect(request.params?.sessionKey).toBe("agent:ops:main");
+    });
+  });
+
   it("uses a timer-safe max gateway timeout when --timeout is 0", async () => {
     await withTempStore(async () => {
       mockGatewaySuccessReply();
@@ -136,6 +149,61 @@ describe("agentCliCommand", () => {
       expect(callGateway).not.toHaveBeenCalled();
       expect(agentCommand).toHaveBeenCalledTimes(1);
       expect(runtime.log).toHaveBeenCalledWith("local");
+    });
+  });
+
+  it("reconciles json output from agent transcript when gateway payloads are incomplete", async () => {
+    await withTempStore(async ({ dir }) => {
+      const originalHome = process.env.HOME;
+      process.env.HOME = dir;
+      try {
+        const sessionsDir = path.join(dir, ".openclaw", "agents", "ops", "sessions");
+        fs.mkdirSync(sessionsDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(sessionsDir, "sessions.json"),
+          JSON.stringify({
+            "agent:ops:main": {
+              sessionId: "sess-1",
+              updatedAt: 123,
+            },
+          }),
+        );
+        fs.writeFileSync(
+          path.join(sessionsDir, "sess-1.jsonl"),
+          `${JSON.stringify({
+            type: "message",
+            message: {
+              role: "assistant",
+              content: [{ text: "<final>Recovered answer" }],
+            },
+          })}\n`,
+        );
+        vi.mocked(callGateway).mockResolvedValue({
+          runId: "idem-1",
+          status: "ok",
+          result: {
+            payloads: [{ text: "⚠️ incomplete gateway payload" }],
+          },
+        });
+
+        await agentCliCommand({ message: "hi", sessionKey: "agent:ops:main", json: true }, runtime);
+
+        const jsonOutput = vi.mocked(runtime.log).mock.calls[0]?.[0];
+        expect(typeof jsonOutput).toBe("string");
+        const parsed = JSON.parse(String(jsonOutput));
+        expect(parsed).toMatchObject({
+          reconciledFromTranscript: true,
+          transcriptPath: path.join(sessionsDir, "sess-1.jsonl"),
+          result: {
+            payloads: [
+              { text: "⚠️ incomplete gateway payload" },
+              { text: "<final>Recovered answer", mediaUrl: null },
+            ],
+          },
+        });
+      } finally {
+        process.env.HOME = originalHome;
+      }
     });
   });
 });
